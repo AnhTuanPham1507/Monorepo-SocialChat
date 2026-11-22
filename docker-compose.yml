@@ -1,0 +1,408 @@
+# =============================================================================
+# SOCIAL CHAT PLATFORM - LOCAL DEVELOPMENT INFRASTRUCTURE
+# =============================================================================
+# Services Architecture (5 microservices):
+#   - auth:         OAuth, tokens, sessions
+#   - user:         Profiles, friends, blocks
+#   - post:         Posts, reactions, comments, feed
+#   - message:      Conversations, messages, presence, typing
+#   - notification: In-app, push notifications
+#
+# Infrastructure:
+#   - PostgreSQL:    Aiven-managed relational storage for application data and Kong
+#   - Redis:         Cache, sessions, presence, pub/sub
+#   - Kafka:         Event streaming, service communication
+#   - Elasticsearch: Search (users, posts, hashtags)
+#   - R2:            Object storage via Cloudflare R2 (no local container needed)
+#   - Keycloak:      OAuth2/OIDC identity provider
+#   - Kong:          API Gateway
+#
+# Supply shared application and database settings from config/.env.common:
+#   docker compose --env-file config/.env.common up -d
+# =============================================================================
+
+services:
+    # =========================================================================
+    # RELATIONAL DATABASE
+    # =========================================================================
+
+    # postgres:
+    #     image: postgres:16-alpine
+    #     container_name: social-chat-postgres
+    #     restart: always
+    #     environment:
+    #         POSTGRES_USER: ${POSTGRES_USER:-postgres}
+    #         POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    #         POSTGRES_DB: ${POSTGRES_DB:-social-chat-local}
+    #     volumes:
+    #         - pg_data:/var/lib/postgresql/data
+    #         - ./docker/postgres/init-databases.sql:/docker-entrypoint-initdb.d/01-init-databases.sql:ro
+    #     ports:
+    #         - '5432:5432'
+    #     healthcheck:
+    #         test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-social-chat-local}']
+    #         interval: 10s
+    #         timeout: 5s
+    #         retries: 5
+    #         start_period: 10s
+    #     networks:
+    #         - social-chat-network
+
+    # =========================================================================
+    # CACHE
+    # =========================================================================
+
+    # redis:
+    #     image: redis:7.2-alpine
+    #     container_name: social-chat-redis
+    #     restart: always
+    #     command: redis-server --requirepass ${REDIS_PASSWORD:-redis123} --appendonly yes
+    #     environment:
+    #         - REDIS_PASSWORD=${REDIS_PASSWORD:-redis123}
+    #     volumes:
+    #         - redis_data:/data
+    #     ports:
+    #         - '6379:6379'
+    #     mem_limit: 512m
+    #     healthcheck:
+    #         test: ['CMD', 'redis-cli', '-a', '${REDIS_PASSWORD:-redis123}', 'ping']
+    #         interval: 10s
+    #         timeout: 5s
+    #         retries: 5
+    #     logging:
+    #         driver: 'json-file'
+    #         options:
+    #             max-size: '5m'
+    #             max-file: '3'
+    #     networks:
+    #         - social-chat-network
+
+    # =========================================================================
+    # SEARCH
+    # =========================================================================
+
+    # elasticsearch:
+    #     build:
+    #         context: ./docker/elasticsearch
+    #         dockerfile: Dockerfile
+    #     container_name: social-chat-elasticsearch
+    #     restart: always
+    #     environment:
+    #         - discovery.type=single-node
+    #         - xpack.security.enabled=false
+    #         - xpack.security.enrollment.enabled=false
+    #         - ES_JAVA_OPTS=-Xms1g -Xmx1g
+    #         - cluster.name=social-chat-cluster
+    #         - network.host=0.0.0.0
+    #         - logger.level=WARN
+    #     volumes:
+    #         - es_data:/usr/share/elasticsearch/data
+    #     ports:
+    #         - '9200:9200'
+    #         - '9300:9300'
+    #     mem_limit: 2g
+    #     healthcheck:
+    #         test: ['CMD-SHELL', 'curl -f http://localhost:9200/_cluster/health || exit 1']
+    #         interval: 30s
+    #         timeout: 10s
+    #         retries: 5
+    #     networks:
+    #         - social-chat-network
+
+    # =========================================================================
+    # MESSAGE QUEUE
+    # =========================================================================
+
+    kafka:
+        image: apache/kafka:3.7.0
+        container_name: social-chat-kafka
+        hostname: kafka
+        restart: always
+        environment:
+            KAFKA_NODE_ID: 1
+            KAFKA_PROCESS_ROLES: 'broker,controller'
+            KAFKA_CONTROLLER_QUORUM_VOTERS: '1@kafka:9093'
+            KAFKA_LISTENERS: 'PLAINTEXT://0.0.0.0:29092,INTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093'
+            KAFKA_ADVERTISED_LISTENERS: 'PLAINTEXT://localhost:29092,INTERNAL://kafka:9092'
+            KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: 'PLAINTEXT:PLAINTEXT,INTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT'
+            KAFKA_CONTROLLER_LISTENER_NAMES: 'CONTROLLER'
+            KAFKA_INTER_BROKER_LISTENER_NAME: 'INTERNAL'
+            # Stable, Kafka-compatible base64 UUID for this local KRaft cluster.
+            CLUSTER_ID: 'MkU3OEVBNTcwNTJENDM2Qk'
+            KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+            KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+            KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+            KAFKA_AUTO_CREATE_TOPICS_ENABLE: 'true'
+            KAFKA_NUM_PARTITIONS: 3
+            KAFKA_MESSAGE_MAX_BYTES: 10485760
+            KAFKA_REPLICA_FETCH_MAX_BYTES: 10485760
+            KAFKA_LOG_SEGMENT_BYTES: 1073741824
+            KAFKA_SOCKET_REQUEST_MAX_BYTES: 104857600
+        ports:
+            - '29092:29092'
+        volumes:
+            - kafka_data:/var/lib/kafka/data
+        healthcheck:
+            test: ['CMD-SHELL', '/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server kafka:9092 > /dev/null 2>&1']
+            interval: 10s
+            timeout: 10s
+            retries: 10
+            start_period: 30s
+        networks:
+            social-chat-network:
+                aliases:
+                    - kafka
+
+    # =========================================================================
+    # API GATEWAY
+    # =========================================================================
+
+    kong-migrations:
+        image: kong:3.9
+        container_name: social-chat-kong-migrations
+        command: kong migrations bootstrap
+        environment:
+            KONG_DATABASE: postgres
+            KONG_PG_HOST: ${DB_HOST:?DB_HOST must be set}
+            KONG_PG_PORT: ${DB_PORT:?DB_PORT must be set}
+            KONG_PG_USER: ${DB_USERNAME:?DB_USERNAME must be set}
+            KONG_PG_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+            KONG_PG_DATABASE: ${DB_DATABASE:?DB_DATABASE must be set}
+            KONG_PG_SSL: 'on'
+            KONG_PG_SSL_VERIFY: 'on'
+            KONG_LUA_SSL_TRUSTED_CERTIFICATE: /etc/kong/secrets/aiven-ca.pem
+        volumes:
+            - ./${DB_SSL_CA_PATH:?DB_SSL_CA_PATH must be set}:/etc/kong/secrets/aiven-ca.pem:ro
+        networks:
+            - social-chat-network
+        restart: on-failure
+
+    kong:
+        image: kong:3.9
+        container_name: social-chat-kong
+        restart: always
+        environment:
+            KONG_DATABASE: postgres
+            KONG_PG_HOST: ${DB_HOST:?DB_HOST must be set}
+            KONG_PG_PORT: ${DB_PORT:?DB_PORT must be set}
+            KONG_PG_USER: ${DB_USERNAME:?DB_USERNAME must be set}
+            KONG_PG_PASSWORD: ${DB_PASSWORD:?DB_PASSWORD must be set}
+            KONG_PG_DATABASE: ${DB_DATABASE:?DB_DATABASE must be set}
+            KONG_PG_SSL: 'on'
+            KONG_PG_SSL_VERIFY: 'on'
+            KONG_LUA_SSL_TRUSTED_CERTIFICATE: /etc/kong/secrets/aiven-ca.pem
+            KONG_PROXY_ACCESS_LOG: /dev/stdout
+            KONG_ADMIN_ACCESS_LOG: /dev/stdout
+            KONG_PROXY_ERROR_LOG: /dev/stderr
+            KONG_ADMIN_ERROR_LOG: /dev/stderr
+            KONG_ADMIN_LISTEN: 0.0.0.0:8001
+            KONG_ADMIN_GUI_URL: http://localhost:8002
+        ports:
+            - '3000:8000'   # Proxy port (client requests)
+            - '3443:8443'   # Proxy SSL port
+            - '8001:8001'   # Admin API port
+            - '8002:8002'   # Kong Manager (Admin GUI)
+        volumes:
+            - ./${DB_SSL_CA_PATH:?DB_SSL_CA_PATH must be set}:/etc/kong/secrets/aiven-ca.pem:ro
+        healthcheck:
+            test: ['CMD', 'kong', 'health']
+            interval: 10s
+            timeout: 5s
+            retries: 5
+        depends_on:
+            kong-migrations:
+                condition: service_completed_successfully
+        networks:
+            - social-chat-network
+
+    # =========================================================================
+    # IDENTITY PROVIDER
+    # =========================================================================
+
+    # keycloak:
+    #     image: quay.io/keycloak/keycloak:25.0.2
+    #     container_name: social-chat-keycloak
+    #     restart: always
+    #     environment:
+    #         KC_DB: postgres
+    #         KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+    #         KC_DB_USERNAME: ${POSTGRES_USER:-postgres}
+    #         KC_DB_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+    #         KC_BOOTSTRAP_ADMIN_USERNAME: admin
+    #         KC_BOOTSTRAP_ADMIN_PASSWORD: admin
+    #         KEYCLOAK_ADMIN: admin
+    #         KEYCLOAK_ADMIN_PASSWORD: admin
+    #         KC_FEATURES: scripts
+    #         # SMTP Configuration for Gmail
+    #         KC_SPI_EMAIL_HOST: smtp.gmail.com
+    #         KC_SPI_EMAIL_PORT: 587
+    #         KC_SPI_EMAIL_FROM: ${GMAIL_ADDRESS:-your-email@gmail.com}
+    #         KC_SPI_EMAIL_FROM_DISPLAY_NAME: Social Chat
+    #         KC_SPI_EMAIL_AUTH: 'true'
+    #         KC_SPI_EMAIL_STARTTLS: 'true'
+    #         KC_SPI_EMAIL_STARTTLS_REQUIRED: 'true'
+    #         KC_SPI_EMAIL_SSL: 'false'
+    #         KC_SPI_EMAIL_USERNAME: ${GMAIL_ADDRESS:-your-email@gmail.com}
+    #         KC_SPI_EMAIL_PASSWORD: ${GMAIL_APP_PASSWORD:-your-app-password}
+    #     depends_on:
+    #         postgres:
+    #             condition: service_healthy
+    #     ports:
+    #         - '8888:8080'
+    #     command:
+    #         - start-dev
+    #         - --spi-script-upload-enabled=true
+    #     volumes:
+    #         - keycloak_data:/opt/keycloak/data
+    #     healthcheck:
+    #         test: ['CMD-SHELL', 'curl -f http://localhost:8888/health/ready || exit 1']
+    #         interval: 30s
+    #         timeout: 10s
+    #         retries: 5
+    #         start_period: 60s
+    #     networks:
+    #         - social-chat-network
+
+    # =========================================================================
+    # DOCUMENT DATABASE (Feed Read Model)
+    # =========================================================================
+
+    # mongodb:
+    #     image: mongo:7.0
+    #     container_name: social-chat-mongodb
+    #     restart: always
+    #     environment:
+    #         MONGO_INITDB_ROOT_USERNAME: ${MONGO_USERNAME:-mongo}
+    #         MONGO_INITDB_ROOT_PASSWORD: ${MONGO_PASSWORD:-mongo123}
+    #     volumes:
+    #         - mongodb_data:/data/db
+    #     ports:
+    #         - '27017:27017'
+    #     healthcheck:
+    #         test: ['CMD', 'mongosh', '--eval', "db.adminCommand('ping')"]
+    #         interval: 10s
+    #         timeout: 5s
+    #         retries: 5
+    #     networks:
+    #         - social-chat-network
+
+    # =========================================================================
+    # CDC (Change Data Capture)
+    # =========================================================================
+
+    kafka-connect:
+        image: debezium/connect:2.5
+        container_name: social-chat-kafka-connect
+        restart: always
+        environment:
+            # Compose services use Kafka's Docker-network listener, not the
+            # localhost listener used by applications running on the host.
+            BOOTSTRAP_SERVERS: kafka:9092
+            GROUP_ID: social-chat-connect
+            CONFIG_STORAGE_TOPIC: connect-configs
+            OFFSET_STORAGE_TOPIC: connect-offsets
+            STATUS_STORAGE_TOPIC: connect-status
+            CONFIG_STORAGE_REPLICATION_FACTOR: 1
+            OFFSET_STORAGE_REPLICATION_FACTOR: 1
+            STATUS_STORAGE_REPLICATION_FACTOR: 1
+            KEY_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+            VALUE_CONVERTER: org.apache.kafka.connect.json.JsonConverter
+            CONNECT_KEY_CONVERTER_SCHEMAS_ENABLE: 'false'
+            CONNECT_VALUE_CONVERTER_SCHEMAS_ENABLE: 'false'
+        ports:
+            - '8083:8083'
+        volumes:
+            # Mount connector JSON definitions (register via curl from host or from inside the container)
+            - ./scripts/connectors:/etc/kafka-connect/connectors:ro
+            # Debezium runs inside Kafka Connect, so the PostgreSQL CA must be
+            # mounted at the container path used by the connector configuration.
+            - ./${DB_SSL_CA_PATH:?DB_SSL_CA_PATH must be set}:/etc/kafka-connect/secrets/aiven-ca.pem:ro
+            # Persist any custom connector plugins you drop in later
+            - kafka_connect_data:/kafka/connect
+        healthcheck:
+            test: ['CMD-SHELL', 'curl -f http://localhost:8083/connectors || exit 1']
+            interval: 10s
+            timeout: 5s
+            retries: 10
+            start_period: 30s
+        depends_on:
+            kafka:
+                condition: service_healthy
+        networks:
+            - social-chat-network
+
+    # =========================================================================
+    # DEVELOPMENT TOOLS (Optional - uncomment if needed)
+    # =========================================================================
+
+    kafka-ui:
+        image: provectuslabs/kafka-ui:latest
+        container_name: social-chat-kafka-ui
+        restart: always
+        environment:
+            KAFKA_CLUSTERS_0_NAME: social-chat-local
+            KAFKA_CLUSTERS_0_BOOTSTRAPSERVERS: kafka:9092
+        ports:
+            - '8081:8080'
+        depends_on:
+            kafka:
+                condition: service_healthy
+        networks:
+            - social-chat-network
+
+    # redis-commander:
+    #     image: rediscommander/redis-commander:latest
+    #     container_name: social-chat-redis-commander
+    #     restart: always
+    #     environment:
+    #         - REDIS_HOSTS=local:redis:6379:0:${REDIS_PASSWORD:-redis123}
+    #     ports:
+    #         - '8082:8081'
+    #     depends_on:
+    #         - redis
+    #     networks:
+    #         - social-chat-network
+
+    # kibana:
+    #     image: docker.elastic.co/kibana/kibana:8.11.0
+    #     container_name: social-chat-kibana
+    #     restart: always
+    #     environment:
+    #         - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    #     ports:
+    #         - '5601:5601'
+    #     depends_on:
+    #         - elasticsearch
+    #     networks:
+    #         - social-chat-network
+
+# =============================================================================
+# VOLUMES
+# =============================================================================
+
+volumes:
+    # pg_data:
+    #     name: social-chat-postgres-data
+    # redis_data:
+    #     name: social-chat-redis-data
+    # es_data:
+    #     name: social-chat-es-data
+    kafka_data:
+        name: social-chat-kafka-data
+    # keycloak_data:
+    #     name: social-chat-keycloak-data
+    # mongodb_data:
+    #     name: social-chat-mongodb-data
+    kafka_connect_data:
+        name: social-chat-kafka-connect-data
+        
+
+# =============================================================================
+# NETWORKS
+# =============================================================================
+
+networks:
+    social-chat-network:
+        name: social-chat-network
+        driver: bridge

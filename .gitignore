@@ -1,0 +1,15 @@
+node_modules
+dist
+
+test/coverage/*
+
+postgres
+
+coverage/*
+test/coverage/*
+
+env/
+
+# Centralized config env files
+config/.env.*
+!config/.env.example
